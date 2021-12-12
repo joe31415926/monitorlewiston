@@ -50,4 +50,33 @@ Raspberry Pi software to monitor my parent's house
     tmpfs /home/pi/ramdisk2 tmpfs size=800000 0 0
     #
     ```
-1. 
+1. install an ssh key which provides access to remote server
+    ```
+    $ cat > ~/.ssh/reversetunnel.pem
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    ...
+    -----END OPENSSH PRIVATE KEY-----
+    $
+    ```
+1. the `monping` program which listens for raw ICMP must run as root
+    ```
+    $ echo "@reboot /home/pi/monping" | sudo crontab -
+    $ sudo crontab -l
+    @reboot /home/pi/monping
+    $ 
+    ```
+1. the rest of the programs can run as user pi
+    ```
+    $ cat | crontab -
+    @reboot /home/pi/crongetip.sh
+    @reboot /home/pi/cronautossh.sh
+    @reboot /home/pi/cronping0.sh
+    @reboot /home/pi/cronping1.sh
+    @reboot /home/pi/cronping2.sh
+    @reboot /home/pi/cronping3.sh
+    @reboot /home/pi/logger
+    @reboot /home/pi/monphone
+    @reboot /home/pi/monwifistrength
+    @reboot /home/pi/mon120v
+    $
+    ```
