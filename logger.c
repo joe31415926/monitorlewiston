@@ -11,119 +11,142 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-uint32_t buffer[300];
-uint32_t buffer_start;
+struct {
+    uint32_t time;
+    uint32_t buf;
+} cache[300];
+int ncache;
 
 int fd;
-uint32_t log_start;
 ssize_t entries_in_file;
-
+uint32_t log_start;
 nfds_t nfds;
 
-void flushbuffer(uint32_t time)
+void flushbuffer(void)
 {
-    if (buffer_start == 0)  // no buffer, yet
-        return;
-    
-    struct timespec clock_mon;
-    assert(clock_gettime(CLOCK_MONOTONIC_RAW, &clock_mon) == 0);
-
-    if (time == 0)      // timeout
-        time = clock_mon.tv_sec;
-
-    assert((time >= buffer_start) && (time < buffer_start + sizeof(buffer)/sizeof(buffer[0])));
-    
-    uint32_t number_of_entries_to_leave_in_buffer = 290;
+    // wait until `/usr/bin/timedatectl -p NTPSynchronized show` returns NTPSynchronized=yes
     int wstatus = system("/home/pi/timesync.sh");
-    if (WIFEXITED(wstatus) && (WEXITSTATUS(wstatus) == 8))
-        number_of_entries_to_leave_in_buffer = 3;
-        
-    if (time <= buffer_start + number_of_entries_to_leave_in_buffer)
+    if (!WIFEXITED(wstatus) || (WEXITSTATUS(wstatus) != 8))
         return;
         
-    uint32_t buffer_entries_to_flush = time - (buffer_start + number_of_entries_to_leave_in_buffer);
-    assert((buffer_entries_to_flush > 0) && (buffer_entries_to_flush <= sizeof(buffer)/sizeof(buffer[0])));
-    
-    assert(clock_gettime(CLOCK_MONOTONIC_RAW, &clock_mon) == 0);
+    // OK, time is synchronized.
     struct timespec clock_real;
     assert(clock_gettime(CLOCK_REALTIME, &clock_real) == 0);
-    uint32_t clock_offset = clock_real.tv_sec - clock_mon.tv_sec;
+    struct timespec clock_mon;
+    assert(clock_gettime(CLOCK_MONOTONIC_RAW, &clock_mon) == 0);
+    uint32_t clock_delta = clock_real.tv_sec - clock_mon.tv_sec;
+    
+    // Do we have anything to write?
+    if (ncache < 1) return;
 
-    time = clock_real.tv_sec;
-    assert(time >= log_start);
-
-    // ensure that there is at least an hour of runway
-    if (time - log_start + 60 * 60 > entries_in_file)
+    int i;    
+    uint32_t earliest_time = cache[0].time;
+    for (i = 1; i < ncache; i++)
+        if (earliest_time > cache[i].time)
+            earliest_time = cache[i].time;
+    
+    // return if the earliest data hasn't "aged" enough.
+    if (earliest_time + 5 > clock_mon.tv_sec)
+        return;
+    
+    uint32_t earliest_real_time = earliest_time + clock_delta;
+    
+    // Has the file been opened?
+    if (fd == -1)
     {
-        // write two hours of zero_entries
+        assert(entries_in_file == -1);
+        assert(log_start == 0);
+        
+        fd = open("log.bin", O_RDWR | O_CREAT, 0666);
+        assert(fd != -1);
+        
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+        
+        struct stat st;
+        assert(fstat(fd, &st) == 0);
+        if (st.st_size >= sizeof(log_start))
+        {
+            assert(read(fd, &log_start, sizeof(log_start)) == sizeof(log_start));
+            assert(earliest_real_time >= log_start);
+            entries_in_file = (st.st_size - sizeof(log_start)) / sizeof(uint32_t);
+        }
+        else
+        {
+            log_start = earliest_real_time;
+            assert(write(fd, &log_start, sizeof(log_start)) == sizeof(log_start));
+            entries_in_file = 0;
+        }
+    }
+
+    // do we have at least an hour's worth of runway?
+    if (earliest_real_time + 60 * 60 - log_start > entries_in_file)
+    {
+        // write two hours of zero_entries just to be safe
         assert(lseek(fd, sizeof(log_start) + entries_in_file * sizeof(uint32_t), SEEK_SET) == sizeof(log_start) + entries_in_file * sizeof(uint32_t));
-        ssize_t entries_to_write = time - log_start + 2 * 60 * 60 - entries_in_file;
+        
+        ssize_t entries_to_write = earliest_real_time + 60 * 60 - log_start - entries_in_file;
+        entries_to_write += 60 * 60;    // add an extra hour
         entries_in_file += entries_to_write;
-        uint32_t zero_entry = 0;
-        while (entries_to_write--)
-            assert(write(fd, &zero_entry, sizeof(zero_entry)) == sizeof(zero_entry));
+        
+        ssize_t bytes_to_write = entries_to_write * sizeof(uint32_t);
+        
+        FILE *logfile = fopen("/home/pi/ramdisk/logger.log", "a");
+        if (logfile)
+        {
+            fprintf(logfile, "%d resize %ld + %ld entries %ld bytes\n", (int) time, (long) entries_in_file, (long) entries_to_write, (long) bytes_to_write);
+            fclose(logfile);
+        }
+
+        void *zerobuf = calloc(bytes_to_write, 1);
+        assert(zerobuf);
+        
+        while (bytes_to_write--)
+        {
+            ssize_t bytes_written = write(fd, zerobuf, bytes_to_write);
+            assert(bytes_written > 0);
+            bytes_to_write -= bytes_written;
+        }
+        free(zerobuf);
+        zerobuf = NULL;
     }
     
-    while (buffer_entries_to_flush--)
-    {
-        assert(lseek(fd, sizeof(log_start) + sizeof(uint32_t) * (buffer_start + clock_offset - log_start), SEEK_SET) == sizeof(log_start) + sizeof(uint32_t) * (buffer_start + clock_offset - log_start));
-        buffer[0] |= nfds << 29;
-        assert(write(fd, buffer, sizeof(buffer[0])) == sizeof(buffer[0]));
-        
-        memmove(buffer, buffer + 1, (sizeof(buffer) / sizeof(buffer[0]) - 1) * sizeof(buffer[0]));
-        memset(buffer + (sizeof(buffer) / sizeof(buffer[0]) - 1), 0, sizeof(buffer[0]));
-        buffer_start++;
-    }
+    for (i = 0; i < ncache; i++)
+        if (cache[i].time + 5 < clock_mon.tv_sec)
+        {
+            uint32_t real_time = cache[i].time + clock_delta;
+            assert((real_time >= log_start) && (real_time - log_start < entries_in_file));
+            
+            // write it
+            assert(lseek(fd, sizeof(log_start) + sizeof(uint32_t) * (real_time - log_start), SEEK_SET) == sizeof(log_start) + sizeof(uint32_t) * (real_time - log_start));
+            cache[i].buf |= nfds << 29;
+            assert(write(fd, &cache[i].buf, sizeof(cache[i].buf)) == sizeof(cache[i].buf));
+            
+            // remove it
+            cache[i] = cache[ncache - 1];
+            ncache--;
+            i--;
+        }
 }
 
-void child()
+void child(void)
 {
+    ncache = 0;
+    fd = -1;
+    entries_in_file = -1;
+    log_start = 0;
+    nfds = 1;
+    
     FILE *logfile = fopen("/home/pi/ramdisk/logger.log", "a");
     if (logfile)
     {
-        fprintf(logfile, "restart %d\n", (int) time(NULL));
+        struct timespec clock_real;
+        assert(clock_gettime(CLOCK_REALTIME, &clock_real) == 0);
+        struct timespec clock_mon;
+        assert(clock_gettime(CLOCK_MONOTONIC_RAW, &clock_mon) == 0);
+        fprintf(logfile, "restart %d %d %d\n", (int) time(NULL), (int) clock_mon.tv_sec, (int) clock_real.tv_sec);
         fclose(logfile);
     }
     
-    fd = open("log.bin", O_RDWR | O_CREAT, 0666);
-    assert(fd > 2);
-    
-    struct stat st;
-    assert(fstat(fd, &st) == 0);
-    
-    assert(lseek(fd, 0, SEEK_SET) == 0);
-    
-
-    struct timespec clock_real;
-    assert(clock_gettime(CLOCK_REALTIME, &clock_real) == 0);
-    uint32_t time = clock_real.tv_sec;
-    
-    if (st.st_size >= sizeof(log_start))
-    {
-        assert(read(fd, &log_start, sizeof(log_start)) == sizeof(log_start));
-        assert(time >= log_start);
-        entries_in_file = (st.st_size - sizeof(log_start)) / sizeof(uint32_t);
-    }
-    else
-    {
-        log_start = time;
-        assert(write(fd, &log_start, sizeof(log_start)) == sizeof(log_start));
-        entries_in_file = 0;
-    }
-        
-    // ensure that there is at least an hour of runway
-    if (time - log_start + 60 * 60 > entries_in_file)
-    {
-        // write two hours of zero_entries
-        assert(lseek(fd, sizeof(log_start) + entries_in_file * sizeof(uint32_t), SEEK_SET) == sizeof(log_start) + entries_in_file * sizeof(uint32_t));
-        ssize_t entries_to_write = time - log_start + 2 * 60 * 60 - entries_in_file;
-        entries_in_file += entries_to_write;
-        uint32_t zero_entry = 0;
-        while (entries_to_write--)
-            assert(write(fd, &zero_entry, sizeof(zero_entry)) == sizeof(zero_entry));
-    }
-    
-    nfds = 1;
     struct pollfd *fds = calloc(nfds, sizeof(fds[0]));
     assert(fds != NULL);
     
@@ -142,73 +165,57 @@ void child()
     assert(bind(fds[0].fd, (struct sockaddr *) &addr, sizeof(addr)) == 0);
     
     assert(listen(fds[0].fd, 10) == 0);
-    
-    memset(buffer, 0, sizeof(buffer));
-    buffer_start = 0;
 
     while (1)
     {
-        fds[0].events = POLLIN | POLLPRI;
-        
         int i;
-        for (i = 1; i < nfds; i++)
+        for (i = 0; i < nfds; i++)
             fds[i].events = POLLIN | POLLPRI;
         
         int pollret = poll(fds, nfds, 250);
         assert(pollret != -1);
         
-        if (pollret)
+        for (i = 1; i < nfds; i++)
         {
-
-            for (i = 1; i < nfds; i++)
+            assert((fds[i].revents == 0) || (fds[i].revents == POLLIN));
+            if (fds[i].revents == POLLIN)
             {
-                assert((fds[i].revents == 0) || (fds[i].revents == POLLIN));
-                if (fds[i].revents == POLLIN)
+                struct {
+                    uint32_t time;
+                    uint32_t data;
+                    uint32_t mask;
+                } message;
+                assert(recv(fds[i].fd, &message, sizeof(message), 0) == sizeof(message));
+                
+                int idx = 0;
+                while ((idx < ncache) && (cache[idx].time != message.time))
+                    idx++;
+                if (idx == ncache)
                 {
-                    struct {
-                        uint32_t time;
-                        uint32_t data;
-                        uint32_t mask;
-                    } message;
-                    assert(recv(fds[i].fd, &message, sizeof(message), 0) == sizeof(message));
-                    
-                    if (buffer_start == 0)
-                        buffer_start = message.time;
-                    assert(message.time >= buffer_start - 2);
-                    if (message.time < buffer_start)
-                    {
-                        size_t bytes_to_shift = (buffer_start - message.time) * sizeof(buffer[0]);
-                        memmove(buffer + bytes_to_shift, buffer, sizeof(buffer) - bytes_to_shift);
-                        memset(buffer, 0, bytes_to_shift);
-                        buffer_start = message.time;
-                    }
-                    
-                    flushbuffer(message.time);
-                    
-                    int idx = message.time - buffer_start;
-                    assert((idx >= 0) && (idx < sizeof(buffer) / sizeof(buffer[0])));
-                    buffer[idx] &= ~message.mask;
-                    buffer[idx] |= message.data;
-                } 
-            }
-            assert((fds[0].revents == 0) || (fds[0].revents == POLLIN));
-            if (fds[0].revents == POLLIN)
-            {
-                nfds++;
-                fds = realloc(fds, nfds * sizeof(struct pollfd));
-                assert(fds);
-                fds[nfds-1].fd = accept(fds[0].fd, NULL, NULL);
-                assert(fds[nfds-1].fd != -1);
+                    ncache++;
+                    assert(ncache < sizeof(cache) / sizeof(cache[0]));
+                    cache[idx].time = message.time;
+                    cache[idx].buf = 0;
+                }
+                cache[idx].buf &= ~message.mask;
+                cache[idx].buf |= message.data;
             } 
         }
-        else
-            flushbuffer(0);             // timeout
+        assert((fds[0].revents == 0) || (fds[0].revents == POLLIN));
+        if (fds[0].revents == POLLIN)
+        {
+            nfds++;
+            fds = realloc(fds, nfds * sizeof(struct pollfd));
+            assert(fds);
+            fds[nfds-1].fd = accept(fds[0].fd, NULL, NULL);
+            assert(fds[nfds-1].fd != -1);
+        } 
+        
+        flushbuffer();             // timeout
     }
-    
-    exit(-1);
 }
 
-void mommy()
+void mommy(void)
 {
     while (1)
     {
